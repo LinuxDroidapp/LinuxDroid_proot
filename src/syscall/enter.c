@@ -28,6 +28,33 @@
 #include <limits.h>      /* PATH_MAX, */
 #include <string.h>      /* strcpy */
 #include <sys/prctl.h>   /* PR_SET_DUMPABLE */
+#include <stdint.h>      /* uint64_t */
+#include <sched.h>       /* CLONE_* */
+
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS 0x00020000
+#endif
+#ifndef CLONE_NEWCGROUP
+#define CLONE_NEWCGROUP 0x02000000
+#endif
+#ifndef CLONE_NEWUTS
+#define CLONE_NEWUTS 0x04000000
+#endif
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC 0x08000000
+#endif
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+#ifndef CLONE_NEWPID
+#define CLONE_NEWPID 0x20000000
+#endif
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET 0x40000000
+#endif
+
+#define CLONE_NS_MASK ((word_t)(CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET))
+
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
 #include "syscall/socket.h"
@@ -122,6 +149,7 @@ int translate_syscall_enter(Tracee *tracee)
 		break;
 
 	case PR_execve:
+	case PR_execveat:
 		status = translate_execve_enter(tracee);
 		break;
 
@@ -502,6 +530,33 @@ int translate_syscall_enter(Tracee *tracee)
 		status = translate_sysarg(tracee, SYSARG_2, REGULAR);
 		break;
 
+	case PR_openat2: {
+		struct {
+			uint64_t flags;
+			uint64_t mode;
+			uint64_t resolve;
+		} how = { 0 };
+		word_t how_size = peek_reg(tracee, CURRENT, SYSARG_4);
+		if (how_size > sizeof(how))
+			how_size = sizeof(how);
+		status = read_data(tracee, &how, peek_reg(tracee, CURRENT, SYSARG_3), how_size);
+		if (status < 0)
+			break;
+
+		/* If complex RESOLVE_* flags are specified (e.g. RESOLVE_BENEATH, RESOLVE_IN_ROOT),
+		 * standard openat cannot enforce them rootlessly. Return -ENOSYS so the C library
+		 * falls back cleanly to openat or handles the limitation. */
+		if (how.resolve != 0) {
+			status = -ENOSYS;
+			break;
+		}
+
+		set_sysnum(tracee, PR_openat);
+		poke_reg(tracee, SYSARG_3, (word_t) how.flags);
+		poke_reg(tracee, SYSARG_4, (word_t) how.mode);
+		/* Fall through into PR_openat */
+	}
+
 	case PR_openat:
 		dirfd = peek_reg(tracee, CURRENT, SYSARG_1);
 		flags = peek_reg(tracee, CURRENT, SYSARG_3);
@@ -579,6 +634,31 @@ int translate_syscall_enter(Tracee *tracee)
 			set_sysnum(tracee, PR_void);
 			status = 0;
 		}
+		break;
+
+	case PR_clone: {
+		word_t flags = peek_reg(tracee, CURRENT, SYSARG_1);
+		if ((flags & CLONE_NS_MASK) != 0)
+			poke_reg(tracee, SYSARG_1, flags & ~CLONE_NS_MASK);
+		status = 0;
+		break;
+	}
+
+	case PR_clone3: {
+		word_t args_addr = peek_reg(tracee, CURRENT, SYSARG_1);
+		if (args_addr != 0) {
+			errno = 0;
+			word_t flags = peek_word(tracee, args_addr);
+			if (errno == 0 && (flags & CLONE_NS_MASK) != 0)
+				poke_word(tracee, args_addr, flags & ~CLONE_NS_MASK);
+		}
+		status = 0;
+		break;
+	}
+
+	case PR_unshare:
+	case PR_setns:
+		status = -EPERM;
 		break;
 	}
 

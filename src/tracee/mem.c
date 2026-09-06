@@ -41,6 +41,11 @@
 #include "build.h"           /* HAVE_PROCESS_VM,  */
 #include "cli/note.h"
 
+#if defined(HAVE_PROCESS_VM) && defined(__ANDROID__)
+extern ssize_t process_vm_readv(pid_t pid, const struct iovec *local_iov, unsigned long liovcnt, const struct iovec *remote_iov, unsigned long riovcnt, unsigned long flags);
+extern ssize_t process_vm_writev(pid_t pid, const struct iovec *local_iov, unsigned long liovcnt, const struct iovec *remote_iov, unsigned long riovcnt, unsigned long flags);
+#endif
+
 /**
  * Load the word at the given @address, potentially *not* aligned.
  */
@@ -82,6 +87,11 @@ static inline void store_word(void *address, word_t value)
  */
 int write_data(const Tracee *tracee, word_t dest_tracee, const void *src_tracer, word_t size)
 {
+	word_t orig_dest = dest_tracee;
+	dest_tracee = UNTAG_ADDRESS(dest_tracee);
+	if (orig_dest != dest_tracee) {
+		VERBOSE(tracee, 3, "write_data: untagged original=0x%lx -> normalized=0x%lx", orig_dest, dest_tracee);
+	}
 	word_t *src  = (word_t *)src_tracer;
 	word_t *dest = (word_t *)dest_tracee;
 
@@ -117,7 +127,7 @@ int write_data(const Tracee *tracee, word_t dest_tracee, const void *src_tracer,
 	for (i = 0; i < nb_full_words; i++) {
 		status = ptrace(PTRACE_POKEDATA, tracee->pid, dest + i, load_word(&src[i]));
 		if (status < 0) {
-			note(tracee, WARNING, SYSTEM, "ptrace(POKEDATA)");
+			note(tracee, WARNING, SYSTEM, "write_data: ptrace(POKEDATA, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(dest + i), strerror(errno));
 			return -EFAULT;
 		}
 	}
@@ -128,9 +138,9 @@ int write_data(const Tracee *tracee, word_t dest_tracee, const void *src_tracer,
 	/* Copy the bytes in the last word carefully since we have to
 	 * overwrite only the relevant ones. */
 
-	word = ptrace(PTRACE_PEEKDATA, tracee->pid, dest + i, NULL);
-	if (errno != 0) {
-		note(tracee, WARNING, SYSTEM, "ptrace(PEEKDATA)");
+	status = peek_tracee_word_pid(tracee->pid, (word_t)(dest + i), &word);
+	if (status < 0) {
+		note(tracee, WARNING, SYSTEM, "write_data: ptrace(PEEKDATA, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(dest + i), strerror(-status));
 		return -EFAULT;
 	}
 
@@ -142,7 +152,7 @@ int write_data(const Tracee *tracee, word_t dest_tracee, const void *src_tracer,
 
 	status = ptrace(PTRACE_POKEDATA, tracee->pid, dest + i, word);
 	if (status < 0) {
-		note(tracee, WARNING, SYSTEM, "ptrace(POKEDATA)");
+		note(tracee, WARNING, SYSTEM, "write_data: ptrace(POKEDATA last, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(dest + i), strerror(errno));
 		return -EFAULT;
 	}
 
@@ -157,6 +167,7 @@ int write_data(const Tracee *tracee, word_t dest_tracee, const void *src_tracer,
  */
 int writev_data(const Tracee *tracee, word_t dest_tracee, const struct iovec *src_tracer, int src_tracer_count)
 {
+	dest_tracee = UNTAG_ADDRESS(dest_tracee);
 	size_t size;
 	int status;
 	int i;
@@ -196,18 +207,24 @@ int writev_data(const Tracee *tracee, word_t dest_tracee, const struct iovec *sr
  */
 int read_data(const Tracee *tracee, void *dest_tracer, word_t src_tracee, word_t size)
 {
+	word_t orig_src = src_tracee;
+	src_tracee = UNTAG_ADDRESS(src_tracee);
+	if (orig_src != src_tracee) {
+		VERBOSE(tracee, 3, "read_data: untagged original=0x%lx -> normalized=0x%lx", orig_src, src_tracee);
+	}
 	word_t *src  = (word_t *)src_tracee;
 	word_t *dest = (word_t *)dest_tracer;
 
 	word_t nb_trailing_bytes;
 	word_t nb_full_words;
 	word_t word, i, j;
+	int status;
 
 	uint8_t *last_src_word;
 	uint8_t *last_dest_word;
 
 #if defined(HAVE_PROCESS_VM)
-	long status;
+	long pvm_status;
 	struct iovec local;
 	struct iovec remote;
 
@@ -217,8 +234,8 @@ int read_data(const Tracee *tracee, void *dest_tracer, word_t src_tracee, word_t
 	remote.iov_base = src;
 	remote.iov_len  = size;
 
-	status = process_vm_readv(tracee->pid, &local, 1, &remote, 1, 0);
-	if ((size_t) status == size)
+	pvm_status = process_vm_readv(tracee->pid, &local, 1, &remote, 1, 0);
+	if ((size_t) pvm_status == size)
 		return 0;
 	/* Fallback to ptrace if something went wrong.  */
 
@@ -229,9 +246,9 @@ int read_data(const Tracee *tracee, void *dest_tracer, word_t src_tracee, word_t
 
 	/* Copy one word by one word, except for the last one. */
 	for (i = 0; i < nb_full_words; i++) {
-		word = ptrace(PTRACE_PEEKDATA, tracee->pid, src + i, NULL);
-		if (errno != 0) {
-			note(tracee, WARNING, SYSTEM, "ptrace(PEEKDATA)");
+		status = peek_tracee_word_pid(tracee->pid, (word_t)(src + i), &word);
+		if (status < 0) {
+			note(tracee, WARNING, SYSTEM, "read_data: ptrace(PEEKDATA, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(src + i), strerror(-status));
 			return -EFAULT;
 		}
 		store_word(&dest[i], word);
@@ -243,9 +260,9 @@ int read_data(const Tracee *tracee, void *dest_tracer, word_t src_tracee, word_t
 	/* Copy the bytes from the last word carefully since we have
 	 * to not overwrite the bytes lying beyond @dest_tracer. */
 
-	word = ptrace(PTRACE_PEEKDATA, tracee->pid, src + i, NULL);
-	if (errno != 0) {
-		note(tracee, WARNING, SYSTEM, "ptrace(PEEKDATA)");
+	status = peek_tracee_word_pid(tracee->pid, (word_t)(src + i), &word);
+	if (status < 0) {
+		note(tracee, WARNING, SYSTEM, "read_data: ptrace(PEEKDATA last, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(src + i), strerror(-status));
 		return -EFAULT;
 	}
 
@@ -267,12 +284,18 @@ int read_data(const Tracee *tracee, void *dest_tracer, word_t src_tracee, word_t
  */
 int read_string(const Tracee *tracee, char *dest_tracer, word_t src_tracee, word_t max_size)
 {
+	word_t orig_src = src_tracee;
+	src_tracee = UNTAG_ADDRESS(src_tracee);
+	if (orig_src != src_tracee) {
+		VERBOSE(tracee, 3, "read_string: untagged original=0x%lx -> normalized=0x%lx", orig_src, src_tracee);
+	}
 	word_t *src  = (word_t *)src_tracee;
 	word_t *dest = (word_t *)dest_tracer;
 
 	word_t nb_trailing_bytes;
 	word_t nb_full_words;
 	word_t word, i, j;
+	int status;
 
 	uint8_t *src_word;
 	uint8_t *dest_word;
@@ -299,7 +322,7 @@ int read_string(const Tracee *tracee, char *dest_tracer, word_t src_tracee, word
 	 *
 	 * -- man 2 process_vm_readv
 	 */
-	long status;
+	long pvm_status;
 	size_t size;
 	size_t offset;
 	struct iovec local;
@@ -332,13 +355,16 @@ int read_string(const Tracee *tracee, char *dest_tracer, word_t src_tracee, word
 		remote.iov_base = (uint8_t *)src + offset;
 		remote.iov_len  = size;
 
-		status = process_vm_readv(tracee->pid, &local, 1, &remote, 1, 0);
-		if ((size_t) status != size)
+		pvm_status = process_vm_readv(tracee->pid, &local, 1, &remote, 1, 0);
+		if ((size_t) pvm_status != size) {
+			VERBOSE(tracee, 3, "read_string: process_vm_readv(pid=%d, addr=0x%lx) fallback (%ld: %s)",
+				tracee->pid, (word_t)((uint8_t *)src + offset), pvm_status, strerror(errno));
 			goto fallback;
+		}
 
-		status = strnlen(local.iov_base, size);
-		if ((size_t) status < size) {
-			size = offset + status + 1;
+		pvm_status = strnlen(local.iov_base, size);
+		if ((size_t) pvm_status < size) {
+			size = offset + pvm_status + 1;
 			assert(size <= max_size);
 			return size;
 		}
@@ -356,9 +382,11 @@ fallback:
 
 	/* Copy one word by one word, except for the last one. */
 	for (i = 0; i < nb_full_words; i++) {
-		word = ptrace(PTRACE_PEEKDATA, tracee->pid, src + i, NULL);
-		if (errno != 0)
+		status = peek_tracee_word_pid(tracee->pid, (word_t)(src + i), &word);
+		if (status < 0) {
+			note(tracee, WARNING, SYSTEM, "read_path: ptrace(PEEKDATA, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(src + i), strerror(-status));
 			return -EFAULT;
+		}
 
 		store_word(&dest[i], word);
 
@@ -372,9 +400,11 @@ fallback:
 	/* Copy the bytes from the last word carefully since we have
 	 * to not overwrite the bytes lying beyond @dest_tracer. */
 
-	word = ptrace(PTRACE_PEEKDATA, tracee->pid, src + i, NULL);
-	if (errno != 0)
+	status = peek_tracee_word_pid(tracee->pid, (word_t)(src + i), &word);
+	if (status < 0) {
+		note(tracee, WARNING, SYSTEM, "read_path: ptrace(PEEKDATA last, pid=%d, addr=0x%lx) failed: %s", tracee->pid, (word_t)(src + i), strerror(-status));
 		return -EFAULT;
+	}
 
 	dest_word = (uint8_t *)&dest[i];
 	src_word  = (uint8_t *)&word;
@@ -395,6 +425,11 @@ fallback:
  */
 word_t peek_word(const Tracee *tracee, word_t address)
 {
+	word_t orig_addr = address;
+	address = UNTAG_ADDRESS(address);
+	if (orig_addr != address) {
+		VERBOSE(tracee, 3, "peek_word: untagged original=0x%lx -> normalized=0x%lx", orig_addr, address);
+	}
 	word_t result = 0;
 
 #if defined(HAVE_PROCESS_VM)
@@ -414,14 +449,15 @@ word_t peek_word(const Tracee *tracee, word_t address)
 		return result;
 	/* Fallback to ptrace if something went wrong.  */
 #endif
-	errno = 0;
-	result = (word_t) ptrace(PTRACE_PEEKDATA, tracee->pid, address, NULL);
+	int ptrace_status = peek_tracee_word_pid(tracee->pid, address, &result);
+	if (ptrace_status < 0) {
+		errno = -ptrace_status;
+		if (errno == EIO)
+			errno = EFAULT;
+		return 0;
+	}
 
-	/* From ptrace(2) manual: "Unfortunately, under Linux,
-	 * different variations of this fault will return EIO or
-	 * EFAULT more or less arbitrarily."  */
-	if (errno == EIO)
-		errno = EFAULT;
+	errno = 0;
 
 	/* Use only the 32 LSB when running a 32-bit process on a
 	 * 64-bit kernel. */
@@ -438,7 +474,12 @@ word_t peek_word(const Tracee *tracee, word_t address)
  */
 void poke_word(const Tracee *tracee, word_t address, word_t value)
 {
-	word_t tmp;
+	word_t orig_addr = address;
+	address = UNTAG_ADDRESS(address);
+	if (orig_addr != address) {
+		VERBOSE(tracee, 3, "poke_word: untagged original=0x%lx -> normalized=0x%lx", orig_addr, address);
+	}
+	word_t tmp = 0;
 
 #if defined(HAVE_PROCESS_VM)
 	int status;
@@ -462,9 +503,8 @@ void poke_word(const Tracee *tracee, word_t address, word_t value)
 	/* Don't overwrite the 32 MSB when running a 32-bit process on
 	 * a 64-bit kernel. */
 	if (is_32on64_mode(tracee)) {
-		errno = 0;
-		tmp = (word_t) ptrace(PTRACE_PEEKDATA, tracee->pid, address, NULL);
-		if (errno != 0)
+		int ptrace_status = peek_tracee_word_pid(tracee->pid, address, &tmp);
+		if (ptrace_status < 0)
 			return;
 
 		value |= (tmp & 0xFFFFFFFF00000000ULL);
@@ -535,6 +575,7 @@ word_t alloc_mem(Tracee *tracee, ssize_t size)
  */
 int clear_mem(const Tracee *tracee, word_t address, size_t size)
 {
+	address = UNTAG_ADDRESS(address);
 	int status;
 	void *zeros;
 

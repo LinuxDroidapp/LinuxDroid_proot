@@ -78,10 +78,13 @@ static void get_sysnums(Abi abi, Sysnums *sysnums)
 /**
  * Return the neutral value of @sysnum from the given @abi.
  */
-static Sysnum translate_sysnum(Abi abi, word_t sysnum)
+Sysnum translate_sysnum(Abi abi, word_t sysnum)
 {
 	Sysnums sysnums;
 	word_t index;
+
+	if (sysnum == SYSCALL_AVOIDER || (int)sysnum == -1)
+		return PR_void;
 
 	get_sysnums(abi, &sysnums);
 
@@ -92,7 +95,7 @@ static Sysnum translate_sysnum(Abi abi, word_t sysnum)
 	index = sysnum - sysnums.offset;
 
 	/* Sanity checks.  */
-	if (index > sysnums.length)
+	if (index >= sysnums.length)
 		return PR_void;
 
 	return sysnums.table[index];

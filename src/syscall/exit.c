@@ -21,6 +21,9 @@
  */
 
 #include <errno.h>       /* errno(3), E* */
+#include <unistd.h>      /* faccessat(2), access(2), */
+#include <fcntl.h>       /* AT_*, */
+#include <sys/stat.h>   /* struct stat, fstatat, */
 #include <sys/utsname.h> /* struct utsname, */
 #include <linux/net.h>   /* SYS_*, */
 #include <string.h>      /* strlen(3), */
@@ -92,7 +95,7 @@ void translate_syscall_exit(Tracee *tracee)
 			break;
 		}
 
-		/* Ensure cwd still exists.  */
+		/* Ensure the cwd still exists on the host filesystem.  */
 		status = translate_path(tracee, path, AT_FDCWD, ".", false);
 		if (status < 0)
 			break;
@@ -103,14 +106,15 @@ void translate_syscall_exit(Tracee *tracee)
 			break;
 		}
 
-		/* Overwrite the path.  */
+		/* Write the guest-visible CWD into the tracee's output buffer.
+		 * This overrides any result written by the enter handler and
+		 * handles the case where the buffer was not yet populated.  */
 		output = peek_reg(tracee, ORIGINAL, SYSARG_1);
 		status = write_data(tracee, output, tracee->fs->cwd, new_size);
 		if (status < 0)
 			break;
 
-		/* The value of "status" is used to update the returned value
-		 * in translate_syscall_exit().  */
+		/* Return the length of the CWD string (including NUL).  */
 		status = new_size;
 		break;
 	}
@@ -428,6 +432,7 @@ void translate_syscall_exit(Tracee *tracee)
 #endif
 
 	case PR_execve:
+	case PR_execveat:
 		translate_execve_exit(tracee);
 		goto end;
 
@@ -459,6 +464,35 @@ void translate_syscall_exit(Tracee *tracee)
 
 		/* Don't overwrite the syscall result.  */
 		goto end;
+
+	case PR_faccessat2: {
+		if ((int) syscall_result == -ENOSYS) {
+			char host_path[PATH_MAX];
+			int mode = (int) peek_reg(tracee, ORIGINAL, SYSARG_3);
+			int flags = (int) peek_reg(tracee, ORIGINAL, SYSARG_4);
+			word_t host_addr = peek_reg(tracee, CURRENT, SYSARG_2);
+
+			status = read_path(tracee, host_path, host_addr);
+			if (status >= 0) {
+				int res;
+				if (flags == 0) {
+					res = faccessat(AT_FDCWD, host_path, mode, 0);
+				} else if ((flags & AT_SYMLINK_NOFOLLOW) != 0) {
+					struct stat st;
+					res = fstatat(AT_FDCWD, host_path, &st, AT_SYMLINK_NOFOLLOW);
+				} else {
+					res = faccessat(AT_FDCWD, host_path, mode, flags);
+					if (res < 0 && errno == EINVAL) {
+						/* Fallback if host kernel / libc rejects non-zero flags in faccessat */
+						res = faccessat(AT_FDCWD, host_path, mode, 0);
+					}
+				}
+				status = (res < 0) ? -errno : 0;
+				break;
+			}
+		}
+		goto end;
+	}
 
 	default:
 		goto end;

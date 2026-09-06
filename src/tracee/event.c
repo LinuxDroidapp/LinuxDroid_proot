@@ -33,11 +33,17 @@
 #include <stdbool.h>    /* bool, true, false, */
 #include <assert.h>     /* assert(3), */
 #include <stdlib.h>     /* atexit(3), getenv(3), */
+#include <fcntl.h>      /* AT_*, */
+#include <sys/stat.h>   /* struct stat, fstatat, */
+#if defined(__ANDROID__)
+#include <malloc.h>
+#endif
 #include <talloc.h>     /* talloc_*, */
 #include <inttypes.h>   /* PRI*, */
 #include <linux/version.h> /* KERNEL_VERSION, */
 
 #include "tracee/event.h"
+#include "tracee/mem.h"
 #include "cli/note.h"
 #include "path/path.h"
 #include "path/binding.h"
@@ -89,8 +95,14 @@ int launch_process(Tracee *tracee, char *const argv[])
 
 		/* Improve performance by using seccomp mode 2, unless
 		 * this support is explicitly disabled.  */
-		if (getenv("PROOT_NO_SECCOMP") == NULL)
-			(void) enable_syscall_filtering(tracee);
+		if (getenv("PROOT_NO_SECCOMP") == NULL) {
+			int seccomp_status = enable_syscall_filtering(tracee);
+			if (seccomp_status < 0) {
+				note(tracee, WARNING, INTERNAL, "enable_syscall_filtering failed: %s (errno=%d)",
+					strerror(-seccomp_status), -seccomp_status);
+			}
+		}
+
 
 		/* Now process is ptraced, so the current rootfs is already the
 		 * guest rootfs.  Note: Valgrind can't handle execve(2) on
@@ -386,6 +398,126 @@ int event_loop()
 	return last_exit_status;
 }
 
+static word_t emulate_seccomp_trapped_syscall(Tracee *tracee, int sig_sys)
+{
+	Sysnum sysnum;
+	if (sig_sys >= 0)
+		sysnum = translate_sysnum(get_abi(tracee), (word_t)sig_sys);
+	else
+		sysnum = get_sysnum(tracee, ORIGINAL);
+
+	switch (sysnum) {
+	case PR_setuid:
+	case PR_setuid32:
+	case PR_setgid:
+	case PR_setgid32:
+	case PR_setreuid:
+	case PR_setreuid32:
+	case PR_setregid:
+	case PR_setregid32:
+	case PR_setresuid:
+	case PR_setresuid32:
+	case PR_setresgid:
+	case PR_setresgid32:
+	case PR_setfsuid:
+	case PR_setfsuid32:
+	case PR_setfsgid:
+	case PR_setfsgid32:
+	case PR_setgroups:
+	case PR_setgroups32:
+	case PR_capset:
+	case PR_setdomainname:
+	case PR_sethostname:
+	case PR_chroot:
+	case PR_set_robust_list:
+	case PR_get_robust_list:
+		return 0;
+
+	case PR_capget: {
+		word_t datap = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		if (datap != 0) {
+			uint32_t caps[6] = { 0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU, 0xffffffffU };
+			(void) write_data(tracee, datap, caps, sizeof(caps));
+		}
+		return 0;
+	}
+
+
+	case PR_getgroups:
+	case PR_getgroups32: {
+		int size = peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t list = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		if (size <= 0) {
+			return 1;
+		} else {
+			if (list != 0)
+				poke_uint32(tracee, list, 0);
+			return 1;
+		}
+	}
+
+	case PR_getuid:
+	case PR_getuid32:
+	case PR_geteuid:
+	case PR_geteuid32:
+	case PR_getgid:
+	case PR_getgid32:
+	case PR_getegid:
+	case PR_getegid32:
+		return 0;
+
+	case PR_getresuid:
+	case PR_getresuid32:
+	case PR_getresgid:
+	case PR_getresgid32: {
+		word_t r = peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t e = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		word_t s = peek_reg(tracee, ORIGINAL, SYSARG_3);
+		if (r != 0) poke_uint32(tracee, r, 0);
+		if (e != 0) poke_uint32(tracee, e, 0);
+		if (s != 0) poke_uint32(tracee, s, 0);
+		return 0;
+	}
+
+	case PR_faccessat:
+	case PR_faccessat2: {
+		int dirfd = (int)peek_reg(tracee, ORIGINAL, SYSARG_1);
+		word_t path_addr = peek_reg(tracee, ORIGINAL, SYSARG_2);
+		int mode = (int)peek_reg(tracee, ORIGINAL, SYSARG_3);
+		int flags = (sysnum == PR_faccessat2) ? (int)peek_reg(tracee, ORIGINAL, SYSARG_4) : 0;
+		char path[PATH_MAX];
+		char host_path[PATH_MAX];
+		int status;
+
+		if (path_addr == 0)
+			return (word_t)-EFAULT;
+
+		status = read_path(tracee, path, path_addr);
+		if (status < 0)
+			return (word_t)status;
+
+		status = translate_path(tracee, host_path, dirfd, path, true);
+		if (status < 0)
+			return (word_t)status;
+
+		if (flags == 0) {
+			status = faccessat(AT_FDCWD, host_path, mode, 0);
+		} else if ((flags & AT_SYMLINK_NOFOLLOW) != 0) {
+			struct stat st;
+			status = fstatat(AT_FDCWD, host_path, &st, AT_SYMLINK_NOFOLLOW);
+		} else {
+			status = faccessat(AT_FDCWD, host_path, mode, flags);
+		}
+		if (status < 0)
+			return (word_t)-errno;
+		return 0;
+	}
+
+	default:
+		return (word_t)-ENOSYS;
+	}
+}
+
 /**
  * For kernels >= 4.8.0
  * Handle the current event (@tracee_status) of the given @tracee.
@@ -421,16 +553,23 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee, int tracee_status)
 
 	if (WIFEXITED(tracee_status)) {
 		last_exit_status = WEXITSTATUS(tracee_status);
-		VERBOSE(tracee, 1,
-			"vpid %" PRIu64 ": exited with status %d",
-			tracee->vpid, last_exit_status);
+		note(tracee, INFO, INTERNAL, "[TRACEE_EXIT] pid=%d (vpid %" PRIu64 "): exited with status %d",
+			tracee->pid, tracee->vpid, last_exit_status);
 		terminate_tracee(tracee);
 	}
 	else if (WIFSIGNALED(tracee_status)) {
 		check_architecture(tracee);
-		VERBOSE(tracee, 1,
-			"vpid %" PRIu64 ": terminated with signal %d",
-			tracee->vpid, WTERMSIG(tracee_status));
+		siginfo_t siginfo;
+		bzero(&siginfo, sizeof(siginfo_t));
+		long sig_status = ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &siginfo);
+		int sig_sys = -1;
+		unsigned int sig_arch = 0;
+		if (sig_status == 0) {
+			sig_sys = siginfo.si_syscall;
+			sig_arch = siginfo.si_arch;
+		}
+		note(tracee, ERROR, INTERNAL, "[TRACEE_SIGNALED] pid=%d (vpid %" PRIu64 "): terminated with signal %d (si_code=%d, si_syscall=%d, si_arch=0x%x, si_errno=%d)",
+			tracee->pid, tracee->vpid, WTERMSIG(tracee_status), siginfo.si_code, sig_sys, sig_arch, siginfo.si_errno);
 		terminate_tracee(tracee);
 	}
 	else if (WIFSTOPPED(tracee_status)) {
@@ -440,6 +579,57 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee, int tracee_status)
 
 		switch (signal) {
 			static bool deliver_sigtrap = false;
+
+		case SIGSYS: {
+			siginfo_t siginfo;
+			bzero(&siginfo, sizeof(siginfo_t));
+			long sig_status = ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &siginfo);
+			int sig_sys = -1;
+			unsigned int sig_arch = 0;
+			if (sig_status == 0) {
+				sig_sys = siginfo.si_syscall;
+				sig_arch = siginfo.si_arch;
+			}
+			note(tracee, INFO, INTERNAL, "[SIGSYS_TRAPPED] pid=%d (vpid %" PRIu64 "): signo=%d, si_code=%d (%s), si_syscall=%d, si_arch=0x%x, si_errno=%d",
+				tracee->pid, tracee->vpid, siginfo.si_signo, siginfo.si_code,
+				(siginfo.si_code == 1 ? "SYS_SECCOMP" : "OTHER"),
+				sig_sys, sig_arch, siginfo.si_errno);
+
+			if (siginfo.si_code == 1 /* SYS_SECCOMP */) {
+				status = fetch_regs(tracee);
+				if (status >= 0) {
+					if (sig_sys >= 0) {
+						save_current_regs(tracee, ORIGINAL);
+						poke_reg(tracee, SYSARG_NUM, (word_t) sig_sys);
+						save_current_regs(tracee, ORIGINAL);
+						word_t emulated_result = emulate_seccomp_trapped_syscall(tracee, sig_sys);
+						poke_reg(tracee, SYSARG_RESULT, emulated_result);
+						tracee->_regs_were_changed = true;
+						(void) push_regs(tracee);
+
+						Sysnum emulated_sysnum = translate_sysnum(get_abi(tracee), (word_t)sig_sys);
+						note(tracee, INFO, INTERNAL, "[SECCOMP_EMULATED] pid=%d (vpid %" PRIu64 "): emulated return %ld for trapped syscall %d (sysnum %ld, %s)",
+							tracee->pid, tracee->vpid, (long)emulated_result, sig_sys, (long)emulated_sysnum, stringify_sysnum(emulated_sysnum));
+					} else {
+						/* sig_sys < 0: syscall was voided/cancelled by PRoot (set_sysnum to SYSCALL_AVOIDER -1).
+						 * Android's seccomp filter trapped the -1 syscall number.
+						 * The result register (SYSARG_RESULT) was already assigned by PRoot during sysenter translation
+						 * (e.g., tracee->status for errors such as -ENOENT, or explicit return value).
+						 * Preserving this result prevents clobbering with -ENOSYS. */
+						word_t preserved_result = (tracee->status < 0) ? (word_t)tracee->status : peek_reg(tracee, CURRENT, SYSARG_RESULT);
+						poke_reg(tracee, SYSARG_RESULT, preserved_result);
+						tracee->_regs_were_changed = true;
+						(void) push_regs(tracee);
+
+						Sysnum orig_sysnum = get_sysnum(tracee, ORIGINAL);
+						note(tracee, INFO, INTERNAL, "[SECCOMP_VOID_PRESERVED] pid=%d (vpid %" PRIu64 "): preserved return %ld for voided syscall -1 (orig sysnum %ld, %s)",
+							tracee->pid, tracee->vpid, (long)preserved_result, (long)orig_sysnum, stringify_sysnum(orig_sysnum));
+					}
+					signal = 0;
+				}
+			}
+			break;
+		}
 
 		case SIGTRAP: {
 			const unsigned long default_ptrace_options = (
@@ -579,8 +769,8 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee, int tracee_status)
 			(void) new_child(tracee, 0);
 			break;
 
-		case SIGTRAP | PTRACE_EVENT_VFORK_DONE << 8:
 		case SIGTRAP | PTRACE_EVENT_EXEC  << 8:
+		case SIGTRAP | PTRACE_EVENT_VFORK_DONE << 8:
 		case SIGTRAP | PTRACE_EVENT_EXIT  << 8:
 			signal = 0;
 			break;
@@ -596,6 +786,31 @@ static int handle_tracee_event_kernel_4_8(Tracee *tracee, int tracee_status)
 			/* For each tracee, the first SIGSTOP
 			 * is only used to notify the tracer.  */
 			if (tracee->sigstop == SIGSTOP_IGNORED) {
+				const unsigned long default_ptrace_options = (
+					PTRACE_O_TRACESYSGOOD	|
+					PTRACE_O_TRACEFORK	|
+					PTRACE_O_TRACEVFORK	|
+					PTRACE_O_TRACEVFORKDONE	|
+					PTRACE_O_TRACEEXEC	|
+					PTRACE_O_TRACECLONE	|
+					PTRACE_O_TRACEEXIT);
+
+				/* Configure ptrace options and enable seccomp tracing on initial child synchronization */
+				status = ptrace(PTRACE_SETOPTIONS, tracee->pid, NULL,
+						default_ptrace_options | PTRACE_O_TRACESECCOMP);
+				if (status < 0) {
+					seccomp_enabled = false;
+					status = ptrace(PTRACE_SETOPTIONS, tracee->pid, NULL,
+							default_ptrace_options);
+					if (status < 0) {
+						note(tracee, ERROR, SYSTEM, "ptrace(PTRACE_SETOPTIONS)");
+					}
+				}
+				else {
+					if (getenv("PROOT_NO_SECCOMP") == NULL)
+						seccomp_enabled = true;
+				}
+
 				tracee->sigstop = SIGSTOP_ALLOWED;
 				signal = 0;
 			}
@@ -650,16 +865,23 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 	if (WIFEXITED(tracee_status)) {
 		last_exit_status = WEXITSTATUS(tracee_status);
-		VERBOSE(tracee, 1,
-			"vpid %" PRIu64 ": exited with status %d",
-			tracee->vpid, last_exit_status);
+		note(tracee, INFO, INTERNAL, "[TRACEE_EXIT] pid=%d (vpid %" PRIu64 "): exited with status %d",
+			tracee->pid, tracee->vpid, last_exit_status);
 		terminate_tracee(tracee);
 	}
 	else if (WIFSIGNALED(tracee_status)) {
 		check_architecture(tracee);
-		VERBOSE(tracee, 1,
-			"vpid %" PRIu64 ": terminated with signal %d",
-			tracee->vpid, WTERMSIG(tracee_status));
+		siginfo_t siginfo;
+		bzero(&siginfo, sizeof(siginfo_t));
+		long sig_status = ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &siginfo);
+		int sig_sys = -1;
+		unsigned int sig_arch = 0;
+		if (sig_status == 0) {
+			sig_sys = siginfo.si_syscall;
+			sig_arch = siginfo.si_arch;
+		}
+		note(tracee, ERROR, INTERNAL, "[TRACEE_SIGNALED] pid=%d (vpid %" PRIu64 "): terminated with signal %d (si_code=%d, si_syscall=%d, si_arch=0x%x, si_errno=%d)",
+			tracee->pid, tracee->vpid, WTERMSIG(tracee_status), siginfo.si_code, sig_sys, sig_arch, siginfo.si_errno);
 		terminate_tracee(tracee);
 	}
 	else if (WIFSTOPPED(tracee_status)) {
@@ -669,6 +891,57 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 		switch (signal) {
 			static bool deliver_sigtrap = false;
+
+		case SIGSYS: {
+			siginfo_t siginfo;
+			bzero(&siginfo, sizeof(siginfo_t));
+			long sig_status = ptrace(PTRACE_GETSIGINFO, tracee->pid, NULL, &siginfo);
+			int sig_sys = -1;
+			unsigned int sig_arch = 0;
+			if (sig_status == 0) {
+				sig_sys = siginfo.si_syscall;
+				sig_arch = siginfo.si_arch;
+			}
+			note(tracee, INFO, INTERNAL, "[SIGSYS_TRAPPED] pid=%d (vpid %" PRIu64 "): signo=%d, si_code=%d (%s), si_syscall=%d, si_arch=0x%x, si_errno=%d",
+				tracee->pid, tracee->vpid, siginfo.si_signo, siginfo.si_code,
+				(siginfo.si_code == 1 ? "SYS_SECCOMP" : "OTHER"),
+				sig_sys, sig_arch, siginfo.si_errno);
+
+			if (siginfo.si_code == 1 /* SYS_SECCOMP */) {
+				status = fetch_regs(tracee);
+				if (status >= 0) {
+					if (sig_sys >= 0) {
+						save_current_regs(tracee, ORIGINAL);
+						poke_reg(tracee, SYSARG_NUM, (word_t) sig_sys);
+						save_current_regs(tracee, ORIGINAL);
+						word_t emulated_result = emulate_seccomp_trapped_syscall(tracee, sig_sys);
+						poke_reg(tracee, SYSARG_RESULT, emulated_result);
+						tracee->_regs_were_changed = true;
+						(void) push_regs(tracee);
+
+						Sysnum emulated_sysnum = translate_sysnum(get_abi(tracee), (word_t)sig_sys);
+						note(tracee, INFO, INTERNAL, "[SECCOMP_EMULATED] pid=%d (vpid %" PRIu64 "): emulated return %ld for trapped syscall %d (sysnum %ld, %s)",
+							tracee->pid, tracee->vpid, (long)emulated_result, sig_sys, (long)emulated_sysnum, stringify_sysnum(emulated_sysnum));
+					} else {
+						/* sig_sys < 0: syscall was voided/cancelled by PRoot (set_sysnum to SYSCALL_AVOIDER -1).
+						 * Android's seccomp filter trapped the -1 syscall number.
+						 * The result register (SYSARG_RESULT) was already assigned by PRoot during sysenter translation
+						 * (e.g., tracee->status for errors such as -ENOENT, or explicit return value).
+						 * Preserving this result prevents clobbering with -ENOSYS. */
+						word_t preserved_result = (tracee->status < 0) ? (word_t)tracee->status : peek_reg(tracee, CURRENT, SYSARG_RESULT);
+						poke_reg(tracee, SYSARG_RESULT, preserved_result);
+						tracee->_regs_were_changed = true;
+						(void) push_regs(tracee);
+
+						Sysnum orig_sysnum = get_sysnum(tracee, ORIGINAL);
+						note(tracee, INFO, INTERNAL, "[SECCOMP_VOID_PRESERVED] pid=%d (vpid %" PRIu64 "): preserved return %ld for voided syscall -1 (orig sysnum %ld, %s)",
+							tracee->pid, tracee->vpid, (long)preserved_result, (long)orig_sysnum, stringify_sysnum(orig_sysnum));
+					}
+					signal = 0;
+				}
+			}
+			break;
+		}
 
 		case SIGTRAP: {
 			const unsigned long default_ptrace_options = (
@@ -825,6 +1098,26 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 			/* For each tracee, the first SIGSTOP
 			 * is only used to notify the tracer.  */
 			if (tracee->sigstop == SIGSTOP_IGNORED) {
+				const unsigned long default_ptrace_options = (
+					PTRACE_O_TRACESYSGOOD	|
+					PTRACE_O_TRACEFORK	|
+					PTRACE_O_TRACEVFORK	|
+					PTRACE_O_TRACEVFORKDONE	|
+					PTRACE_O_TRACEEXEC	|
+					PTRACE_O_TRACECLONE	|
+					PTRACE_O_TRACEEXIT);
+
+				/* Configure ptrace options and enable seccomp tracing on initial child synchronization */
+				status = ptrace(PTRACE_SETOPTIONS, tracee->pid, NULL,
+						default_ptrace_options | PTRACE_O_TRACESECCOMP);
+				if (status < 0) {
+					status = ptrace(PTRACE_SETOPTIONS, tracee->pid, NULL,
+							default_ptrace_options);
+					if (status < 0) {
+						note(tracee, ERROR, SYSTEM, "ptrace(PTRACE_SETOPTIONS)");
+					}
+				}
+
 				tracee->sigstop = SIGSTOP_ALLOWED;
 				signal = 0;
 			}

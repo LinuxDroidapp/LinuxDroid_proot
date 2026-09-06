@@ -26,6 +26,9 @@
 #ifndef NO_LIBC_HEADER
 #include <sys/ptrace.h>    /* linux.git:c0a3a20b  */
 #include <linux/audit.h>   /* AUDIT_ARCH_*,  */
+#if defined(__ANDROID__)
+#include <asm/unistd.h>
+#endif
 #endif
 
 typedef unsigned long word_t;
@@ -38,7 +41,7 @@ typedef unsigned char byte_t;
 #define OFFSETOF_STATX_UID 20
 #define OFFSETOF_STATX_GID 24
 
-#if !defined(ARCH_X86_64) && !defined(ARCH_ARM_EABI) && !defined(ARCH_X86) && !defined(ARCH_SH4)
+#if !defined(ARCH_X86_64) && !defined(ARCH_ARM64) && !defined(ARCH_ARM_EABI) && !defined(ARCH_X86) && !defined(ARCH_SH4)
 #    if defined(__x86_64__)
 #        define ARCH_X86_64 1
 #    elif defined(__ARM_EABI__)
@@ -117,6 +120,15 @@ typedef unsigned char byte_t;
 
     #define SYSTRAP_SIZE 4
 
+    #ifndef EM_AARCH64
+        #define EM_AARCH64 183
+    #endif
+    #ifndef __AUDIT_ARCH_64BIT
+        #define __AUDIT_ARCH_64BIT 0x80000000
+    #endif
+    #ifndef __AUDIT_ARCH_LE
+        #define __AUDIT_ARCH_LE 0x40000000
+    #endif
     #ifndef AUDIT_ARCH_AARCH64
         #define AUDIT_ARCH_AARCH64 (EM_AARCH64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE)
     #endif
@@ -174,6 +186,19 @@ typedef unsigned char byte_t;
 
     #error "Unsupported architecture"
 
+#endif
+
+static inline word_t normalize_tracee_address(word_t address)
+{
+#if defined(ARCH_ARM64)
+	return address & 0x00FFFFFFFFFFFFFFULL;
+#else
+	return address;
+#endif
+}
+
+#ifndef UNTAG_ADDRESS
+#define UNTAG_ADDRESS(addr) normalize_tracee_address((word_t)(addr))
 #endif
 
 #endif /* ARCH_H */

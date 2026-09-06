@@ -23,7 +23,8 @@
 #include <stdio.h>         /* printf(3), */
 #include <stdbool.h>       /* bool, true, false,  */
 #include <linux/limits.h>  /* ARG_MAX, PATH_MAX, */
-#include <string.h>        /* str*(3), basename(3),  */
+#include <string.h>        /* str*(3), */
+#include <libgen.h>        /* basename(3),  */
 #include <talloc.h>        /* talloc*,  */
 #include <stdlib.h>        /* exit(3), EXIT_*, strtol(3), {g,s}etenv(3), */
 #include <assert.h>        /* assert(3),  */
@@ -449,10 +450,21 @@ static int parse_config(Tracee *tracee, size_t argc, char *const argv[])
 	return argc_offset;
 }
 
+#if defined(__ANDROID__)
+#include <malloc.h>
+#include <libgen.h>        /* basename(3), */
+#endif
+
 bool exit_failure = true;
+
+static void talloc_log_to_note(const char *message)
+{
+	note(NULL, ERROR, TALLOC, "%s", message);
+}
 
 int main(int argc, char *const argv[])
 {
+
 	Tracee *tracee;
 	int status;
 
@@ -460,7 +472,7 @@ int main(int argc, char *const argv[])
 	talloc_enable_leak_report();
 
 #if defined(TALLOC_VERSION_MAJOR) && TALLOC_VERSION_MAJOR >= 2
-	talloc_set_log_stderr();
+	talloc_set_log_fn(talloc_log_to_note);
 #endif
 
 	/* Pre-create the first tracee (pid == 0).  */
